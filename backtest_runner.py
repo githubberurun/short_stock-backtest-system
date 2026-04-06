@@ -78,8 +78,8 @@ def load_and_merge_data(ticker: str) -> pd.DataFrame:
     return df_daily
 
 def calculate_technical_features(df: pd.DataFrame) -> pd.DataFrame:
-    """バックテストに必要な指標を一括計算（25日・75日移動平均を必須化）"""
-    if df.empty or len(df) < 100:  # IPO直後を弾くための最低期間
+    """バックテストに必要な指標を一括計算（最低期間を100日に短縮）"""
+    if df.empty or len(df) < 100:  
         return df
         
     ps = df['close']
@@ -90,21 +90,18 @@ def calculate_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     rs = gain / loss.replace(0, np.nan)
     df['rsi'] = 100.0 - (100.0 / (1.0 + rs))
     
-    # トレンド判定の要（移動平均線）
     df['m25'] = ps.rolling(25).mean()
     df['m75'] = ps.rolling(75).mean()
     df['d25'] = (ps - df['m25']) / df['m25'] * 100
     
-    # MACD
     ema12 = ps.ewm(span=12, adjust=False).mean()
     ema26 = ps.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     macd_signal = macd.ewm(span=9, adjust=False).mean()
     df['macd_hist'] = macd - macd_signal
-    df['macd_hist_prev'] = df['macd_hist'].shift(1)
     
     if 'mr_ratio' in df.columns:
-        df['mr_zscore'] = (df['mr_ratio'] - df['mr_ratio'].rolling(200).mean()) / df['mr_ratio'].rolling(200).std().replace(0, np.nan)
+        df['mr_zscore'] = (df['mr_ratio'] - df['mr_ratio'].rolling(100).mean()) / df['mr_ratio'].rolling(100).std().replace(0, np.nan)
         
     df['EPS_num'] = pd.to_numeric(df.get('EPS', np.nan), errors='coerce')
     df['BPS_num'] = pd.to_numeric(df.get('BPS', np.nan), errors='coerce')
@@ -114,7 +111,7 @@ def calculate_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def generate_scoring_and_eligibility(df: pd.DataFrame) -> pd.DataFrame:
-    """厳格なダウントレンド判定と、ショート脆弱性スコアの算出"""
+    """現実的なフィルター緩和と相対的な弱さを抽出するスコアリング"""
     if df.empty or 'close' not in df.columns or 'm75' not in df.columns:
         df['is_eligible'] = False
         df['short_score'] = 0
@@ -122,26 +119,28 @@ def generate_scoring_and_eligibility(df: pd.DataFrame) -> pd.DataFrame:
         
     score = pd.Series(0, index=df.index, dtype=int)
     
-    # ファンダメンタルズの悪化
-    score += np.where(df.get('per', 0) > 40.0, 20, 0)
-    score += np.where(df.get('pbr', 0) > 3.0, 10, 0)
-    score += np.where(df.get('rev_growth', 1) < 0, 30, 0) # 成長鈍化はショートの最大の味方
+    # ファンダメンタルズの悪化 (基準を現実的に緩和)
+    score += np.where(df.get('per', 0) > 30.0, 10, 0)
+    score += np.where(df.get('pbr', 0) > 2.0, 10, 0)
+    score += np.where(df.get('rev_growth', 1) < 0, 20, 0) 
     
     # 需給の悪化（買い残の滞留）
-    score += np.where(df.get('mr_zscore', 0) > 1.0, 20, 0) 
+    score += np.where(df.get('mr_zscore', 0) > 0.5, 20, 0) 
     
-    # モメンタムの崩壊（MACDデッドクロス）
-    cond_macd_cross = (df.get('macd_hist_prev', 0) > 0) & (df.get('macd_hist', 0) <= 0)
-    score += np.where(cond_macd_cross, 20, 0)
+    # モメンタムの弱さ（MACDがマイナス圏で推移している間は継続して加点）
+    score += np.where(df.get('macd_hist', 0) < 0, 10, 0)
+    
+    # 直近の弱さ（25日線からの下方乖離が進行中）
+    score += np.where(df.get('d25', 0) < -2.0, 10, 0)
     
     df['short_score'] = score
     
-    # 【最重要】鉄壁のダウントレンド・フィルター
-    # 株価が75日線の下、かつ25日線が75日線の下にある（上昇相場を完全に否定）
-    is_downtrend = (df['close'] < df['m75']) & (df['m25'] < df['m75']) & (df['close'] < df['m25'])
+    # 【改修】ダウントレンド・フィルターの緩和
+    # 「株価が25日線および75日線を下回っていること」だけを確認（上昇モメンタムの否定）
+    is_downtrend = (df['close'] < df['m75']) & (df['close'] < df['m25'])
     
-    # フィルターを通過し、かつ一定のスコアを持つ日だけを「候補」とする
-    df['is_eligible'] = is_downtrend & (score >= 30)
+    # 足切りを最低限（10点）に下げ、ランキング機能に抽出を委ねる
+    df['is_eligible'] = is_downtrend & (score >= 10)
     
     return df
 
@@ -154,7 +153,6 @@ def main() -> None:
         
     daily_files = glob.glob(f"{DATA_DIR}/????.parquet")
     
-    # 全銘柄のデータをメモリに保持する辞書と、ランキング用のメタデータリスト
     data_dict: Dict[str, pd.DataFrame] = {}
     all_scores_list: List[pd.DataFrame] = []
     
@@ -170,10 +168,9 @@ def main() -> None:
         
         if not df.empty:
             data_dict[ticker] = df
-            # ランキング計算用に必要な列だけを抽出してリストに追加（メモリ節約）
             df_meta = df[['date', 'short_score', 'is_eligible']].copy()
             df_meta['ticker'] = ticker
-            df_meta['original_idx'] = df_meta.index # トレード実行時のインデックス検索を高速化
+            df_meta['original_idx'] = df_meta.index 
             all_scores_list.append(df_meta)
             
         if (i + 1) % 100 == 0:
@@ -186,13 +183,10 @@ def main() -> None:
     debug_log("🏆 クロスセクション・ランキングを生成中...")
     df_all_scores = pd.concat(all_scores_list, ignore_index=True)
     
-    # 候補に挙がった日のみを抽出
     df_candidates = df_all_scores[df_all_scores['is_eligible']].copy()
     
-    # 日付ごとにスコアの降順でランキング付け（同点の場合は元のインデックス順等）
     df_candidates['rank'] = df_candidates.groupby('date')['short_score'].rank(method='first', ascending=False)
     
-    # 各日において、スコアワースト上位 MAX_SHORTS_PER_DAY 銘柄のみを真のシグナルとする
     df_signals = df_candidates[df_candidates['rank'] <= MAX_SHORTS_PER_DAY].sort_values(['date', 'rank'])
     
     total_signals = len(df_signals)
@@ -207,7 +201,6 @@ def main() -> None:
         idx = row.original_idx
         df_ticker = data_dict[ticker]
         
-        # 翌日の始値でエントリー
         entry_idx = idx + 1
         if entry_idx >= len(df_ticker):
             continue
@@ -222,7 +215,6 @@ def main() -> None:
         exit_price = df_ticker.at[exit_idx, 'close']
         exit_reason = "time_stop"
         
-        # 期間中のストップロスとテイクプロフィットの判定
         for j in range(entry_idx, exit_idx + 1):
             high_p = df_ticker.at[j, 'high']
             low_p = df_ticker.at[j, 'low']
@@ -259,15 +251,14 @@ def main() -> None:
         debug_log("⚠️ シミュレーションの結果、成立したトレードがありません。")
         return
         
-    # --- パフォーマンスの集計 ---
     df_trades = pd.DataFrame(all_trades)
     
     total_trades = len(df_trades)
     winning_trades = df_trades[df_trades['return_pct'] > 0]
     losing_trades = df_trades[df_trades['return_pct'] <= 0]
     
-    win_rate = (len(winning_trades) / total_trades) * 100
-    avg_return = df_trades['return_pct'].mean()
+    win_rate = (len(winning_trades) / total_trades) * 100 if total_trades > 0 else 0
+    avg_return = df_trades['return_pct'].mean() if total_trades > 0 else 0
     
     gross_profit = winning_trades['return_pct'].sum()
     gross_loss = abs(losing_trades['return_pct'].sum())
@@ -275,7 +266,7 @@ def main() -> None:
     
     debug_log("=========================================")
     debug_log(f"📈 バックテスト結果サマリ (クロスセクション・ショート戦略)")
-    debug_log(f" - 総トレード数: {total_trades} 回 (激減しているはずです)")
+    debug_log(f" - 総トレード数: {total_trades} 回")
     debug_log(f" - 勝率: {win_rate:.2f} %")
     debug_log(f" - 1トレード平均利益: {avg_return:.2f} %")
     debug_log(f" - プロフィットファクター (PF): {profit_factor:.2f}")
@@ -293,10 +284,9 @@ def run_integrity_tests() -> None:
     assert calculate_technical_features(df_empty).empty, "calc_tech failed on empty df"
     assert generate_scoring_and_eligibility(df_empty).empty, "generate_signals failed on empty df"
     
-    # クロスセクション判定用のダミーデータテスト
     df_dummy = pd.DataFrame({
         'date': pd.date_range(start='2025-01-01', periods=150),
-        'close': np.linspace(2000, 1000, 150) # 明確なダウントレンド
+        'close': np.linspace(2000, 1000, 150) 
     })
     df_tech = calculate_technical_features(df_dummy)
     df_scored = generate_scoring_and_eligibility(df_tech)
