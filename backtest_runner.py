@@ -10,7 +10,6 @@ from datetime import datetime
 # Pandas: https://pandas.pydata.org/docs/
 # ==========================================
 
-# ※ Pandasの将来仕様（サイレントダウンキャスト廃止）対応は最新環境で非推奨となったため削除
 pd.options.mode.chained_assignment = None
 
 DATA_DIR: Final[str] = "Colog_github"
@@ -86,6 +85,7 @@ def load_and_merge_data(ticker: str) -> pd.DataFrame:
 
 def calculate_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     """バックテストに必要なテクニカル・ファンダメンタル指標を一括計算"""
+    # 200日未満のデータしかない銘柄は長期指標が計算できないためスキップ
     if df.empty or len(df) < 200:
         return df
         
@@ -300,8 +300,11 @@ def run_integrity_tests() -> None:
     assert generate_short_signals(df_empty).empty, "generate_signals failed on empty df"
     assert len(simulate_trades(df_empty, "9999")) == 0, "simulate_trades failed on empty df"
     
-    # 欠損カラムに対する耐性テスト
-    df_missing_cols = pd.DataFrame({'date': ['2026-01-01'], 'close': [1000]})
+    # 欠損カラムに対する耐性テスト (早期リターン条件である200行以上のダミーデータを生成して検証)
+    df_missing_cols = pd.DataFrame({
+        'date': pd.date_range(start='2025-01-01', periods=205),
+        'close': np.ones(205) * 1000.0
+    })
     assert 'rsi' in calculate_technical_features(df_missing_cols).columns, "Should handle missing cols gracefully"
     
     print("✅ 全検証合格。")
