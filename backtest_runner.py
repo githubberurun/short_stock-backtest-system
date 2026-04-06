@@ -13,20 +13,41 @@ from datetime import datetime
 pd.options.mode.chained_assignment = None
 
 DATA_DIR: Final[str] = "Colog_github"
+BENCHMARK_TICKER: Final[str] = "13060" # TOPIX連動ETF
 
-# --- パラメータ設定 (クロスセクション統合版) ---
-MAX_SHORTS_PER_DAY: Final[int] = 5   # 1日にショートを仕掛ける最大銘柄数（ワーストランキング上位）
-HOLDING_PERIOD: Final[int] = 5       # エントリー後の保有日数
-STOP_LOSS_PCT: Final[float] = 0.05   # ストップロス（逆行5%で損切り）
-TARGET_PROFIT: Final[float] = 0.10   # 利益確定（順行10%で利確）
+# --- パラメータ設定 (市場連動＆短期エグジット統合版) ---
+MAX_SHORTS_PER_DAY: Final[int] = 5   # 1日にショートを仕掛ける最大銘柄数
+HOLDING_PERIOD: Final[int] = 3       # 【改修】保有日数を5日から3日へ短縮（自律反発を回避）
+STOP_LOSS_PCT: Final[float] = 0.04   # 【改修】ストップロス（逆行4%で損切り、よりタイトに）
+TARGET_PROFIT: Final[float] = 0.05   # 【改修】利益確定（順行5%で即利確、初動だけを抜く）
 
 def debug_log(msg: str) -> None:
     if not isinstance(msg, str): 
         raise TypeError("msg must be a string")
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-def load_and_merge_data(ticker: str) -> pd.DataFrame:
-    """日足、信用残、財務データを読み込み、日付で結合して前日補完(ffill)する"""
+def load_market_index() -> pd.DataFrame:
+    """TOPIX(13060)のデータを読み込み、市場全体のトレンドを判定する"""
+    daily_file = f"{DATA_DIR}/{BENCHMARK_TICKER}.parquet"
+    if not os.path.exists(daily_file):
+        debug_log(f"⚠️ ベンチマーク({BENCHMARK_TICKER})のデータがありません。市場フィルターは無効化されます。")
+        return pd.DataFrame()
+        
+    df = pd.read_parquet(daily_file)
+    if df.empty or 'date' not in df.columns or 'close' not in df.columns:
+        return pd.DataFrame()
+        
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date').reset_index(drop=True)
+    
+    # TOPIXの25日移動平均線を計算し、終値がそれを下回っているかを判定
+    df['idx_m25'] = df['close'].rolling(25).mean()
+    df['is_market_downtrend'] = df['close'] < df['idx_m25']
+    
+    return df[['date', 'is_market_downtrend']].dropna()
+
+def load_and_merge_data(ticker: str, df_market: pd.DataFrame) -> pd.DataFrame:
+    """日足、信用残、財務データを読み込み、さらに市場トレンドフラグを結合する"""
     daily_file = f"{DATA_DIR}/{ticker}.parquet"
     margin_file = f"{DATA_DIR}/{ticker}_margin.parquet"
     fins_file = f"{DATA_DIR}/{ticker}_fins.parquet"
@@ -41,6 +62,13 @@ def load_and_merge_data(ticker: str) -> pd.DataFrame:
     df_daily['date'] = pd.to_datetime(df_daily['date'])
     df_daily = df_daily.sort_values('date').reset_index(drop=True)
     
+    # TOPIXデータの結合 (市場フィルター)
+    if not df_market.empty:
+        df_daily = pd.merge(df_daily, df_market, on='date', how='left')
+        df_daily['is_market_downtrend'] = df_daily['is_market_downtrend'].ffill()
+    else:
+        df_daily['is_market_downtrend'] = True # ベンチマークがない場合はフィルターをパスさせる
+        
     if os.path.exists(margin_file):
         df_margin = pd.read_parquet(margin_file)
         if not df_margin.empty and 'date' in df_margin.columns:
@@ -70,15 +98,16 @@ def load_and_merge_data(ticker: str) -> pd.DataFrame:
             df_fins = df_fins[['date', 'EPS', 'BPS', 'rev_growth']].dropna(how='all')
             df_daily = pd.merge(df_daily, df_fins, on='date', how='left')
             
-    for col in ['EPS', 'BPS', 'rev_growth']:
+    for col in ['EPS', 'BPS', 'rev_growth', 'is_market_downtrend']:
         if col not in df_daily.columns:
-            df_daily[col] = np.nan
-        df_daily[col] = df_daily[col].ffill()
+            df_daily[col] = np.nan if col != 'is_market_downtrend' else True
+        if col != 'is_market_downtrend':
+            df_daily[col] = df_daily[col].ffill()
         
     return df_daily
 
 def calculate_technical_features(df: pd.DataFrame) -> pd.DataFrame:
-    """バックテストに必要な指標を一括計算（最低期間を100日に短縮）"""
+    """バックテストに必要な指標を一括計算"""
     if df.empty or len(df) < 100:  
         return df
         
@@ -111,7 +140,7 @@ def calculate_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def generate_scoring_and_eligibility(df: pd.DataFrame) -> pd.DataFrame:
-    """現実的なフィルター緩和と相対的な弱さを抽出するスコアリング"""
+    """市場フィルター適用と相対的な弱さを抽出するスコアリング"""
     if df.empty or 'close' not in df.columns or 'm75' not in df.columns:
         df['is_eligible'] = False
         df['short_score'] = 0
@@ -119,7 +148,7 @@ def generate_scoring_and_eligibility(df: pd.DataFrame) -> pd.DataFrame:
         
     score = pd.Series(0, index=df.index, dtype=int)
     
-    # ファンダメンタルズの悪化 (基準を現実的に緩和)
+    # ファンダメンタルズの悪化
     score += np.where(df.get('per', 0) > 30.0, 10, 0)
     score += np.where(df.get('pbr', 0) > 2.0, 10, 0)
     score += np.where(df.get('rev_growth', 1) < 0, 20, 0) 
@@ -127,42 +156,50 @@ def generate_scoring_and_eligibility(df: pd.DataFrame) -> pd.DataFrame:
     # 需給の悪化（買い残の滞留）
     score += np.where(df.get('mr_zscore', 0) > 0.5, 20, 0) 
     
-    # モメンタムの弱さ（MACDがマイナス圏で推移している間は継続して加点）
+    # モメンタムの弱さ
     score += np.where(df.get('macd_hist', 0) < 0, 10, 0)
     
-    # 直近の弱さ（25日線からの下方乖離が進行中）
+    # 直近の弱さ
     score += np.where(df.get('d25', 0) < -2.0, 10, 0)
     
     df['short_score'] = score
     
-    # 【改修】ダウントレンド・フィルターの緩和
-    # 「株価が25日線および75日線を下回っていること」だけを確認（上昇モメンタムの否定）
-    is_downtrend = (df['close'] < df['m75']) & (df['close'] < df['m25'])
+    # 【改修1】個別銘柄が下降トレンド気味であること
+    is_stock_weak = (df['close'] < df['m75']) & (df['close'] < df['m25'])
     
-    # 足切りを最低限（10点）に下げ、ランキング機能に抽出を委ねる
-    df['is_eligible'] = is_downtrend & (score >= 10)
+    # 【改修2】TOPIX(市場全体)がダウントレンドであること
+    # bool型への明示的なキャストと欠損値処理
+    is_market_weak = df.get('is_market_downtrend', pd.Series(True, index=df.index)).fillna(True).astype(bool)
+    
+    # 両方の弱さが合致した日のみエントリー候補とする
+    df['is_eligible'] = is_stock_weak & is_market_weak & (score >= 10)
     
     return df
 
 def main() -> None:
-    debug_log("🚀 クロスセクション・ショート戦略シミュレーター起動")
+    debug_log("🚀 クロスセクション・ショート戦略シミュレーター起動 (市場フィルター実装版)")
     
     if not os.path.exists(DATA_DIR):
         debug_log(f"❌ データディレクトリ {DATA_DIR} が見つかりません。")
         return
         
+    # 市場全体のトレンド(TOPIX)をロード
+    debug_log(f"📈 ベンチマーク({BENCHMARK_TICKER})データをロード中...")
+    df_market = load_market_index()
+    
     daily_files = glob.glob(f"{DATA_DIR}/????.parquet")
     
     data_dict: Dict[str, pd.DataFrame] = {}
     all_scores_list: List[pd.DataFrame] = []
     
-    debug_log(f"📊 データロード＆スコアリング開始 (対象: {len(daily_files)}銘柄)")
+    debug_log(f"📊 個別銘柄ロード＆スコアリング開始 (対象: {len(daily_files)}銘柄)")
     
     for i, file_path in enumerate(daily_files):
         ticker = os.path.basename(file_path).replace('.parquet', '')
         if not ticker.isdigit(): continue
+        if ticker == BENCHMARK_TICKER: continue # ベンチマーク自身はトレード対象から除外
             
-        df = load_and_merge_data(ticker)
+        df = load_and_merge_data(ticker, df_market)
         df = calculate_technical_features(df)
         df = generate_scoring_and_eligibility(df)
         
@@ -265,7 +302,7 @@ def main() -> None:
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
     
     debug_log("=========================================")
-    debug_log(f"📈 バックテスト結果サマリ (クロスセクション・ショート戦略)")
+    debug_log(f"📈 バックテスト結果サマリ (市場連動ショート戦略)")
     debug_log(f" - 総トレード数: {total_trades} 回")
     debug_log(f" - 勝率: {win_rate:.2f} %")
     debug_log(f" - 1トレード平均利益: {avg_return:.2f} %")
@@ -289,8 +326,9 @@ def run_integrity_tests() -> None:
         'close': np.linspace(2000, 1000, 150) 
     })
     df_tech = calculate_technical_features(df_dummy)
+    # 市場フィルター（is_market_downtrend）が存在しない場合でも、内部で安全にTrueとして処理されるかをテスト
     df_scored = generate_scoring_and_eligibility(df_tech)
-    assert 'is_eligible' in df_scored.columns, "Should generate eligibility flag"
+    assert 'is_eligible' in df_scored.columns, "Should generate eligibility flag even without market data"
     
     print("✅ 全検証合格。")
 
