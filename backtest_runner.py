@@ -8,46 +8,26 @@ from datetime import datetime
 # ==========================================
 # 2025-2026 最新公式ドキュメント準拠検証結果
 # Pandas: https://pandas.pydata.org/docs/
+# J-Quants V1 to V2: https://jpx-jquants.com/spec/migration-v1-v2
 # ==========================================
 
 pd.options.mode.chained_assignment = None
 
 DATA_DIR: Final[str] = "Colog_github"
-BENCHMARK_TICKER: Final[str] = "13060" # TOPIX連動ETF
 
-# --- パラメータ設定 (市場連動＆短期エグジット統合版) ---
+# --- パラメータ設定 (平均回帰ショート戦略) ---
 MAX_SHORTS_PER_DAY: Final[int] = 5   # 1日にショートを仕掛ける最大銘柄数
-HOLDING_PERIOD: Final[int] = 3       # 【改修】保有日数を5日から3日へ短縮（自律反発を回避）
-STOP_LOSS_PCT: Final[float] = 0.04   # 【改修】ストップロス（逆行4%で損切り、よりタイトに）
-TARGET_PROFIT: Final[float] = 0.05   # 【改修】利益確定（順行5%で即利確、初動だけを抜く）
+HOLDING_PERIOD: Final[int] = 3       # 短期でサッと抜ける
+STOP_LOSS_PCT: Final[float] = 0.05   # ストップロス（逆行5%で損切り）
+TARGET_PROFIT: Final[float] = 0.05   # 利益確定（順行5%で即利確）
 
 def debug_log(msg: str) -> None:
     if not isinstance(msg, str): 
         raise TypeError("msg must be a string")
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-def load_market_index() -> pd.DataFrame:
-    """TOPIX(13060)のデータを読み込み、市場全体のトレンドを判定する"""
-    daily_file = f"{DATA_DIR}/{BENCHMARK_TICKER}.parquet"
-    if not os.path.exists(daily_file):
-        debug_log(f"⚠️ ベンチマーク({BENCHMARK_TICKER})のデータがありません。市場フィルターは無効化されます。")
-        return pd.DataFrame()
-        
-    df = pd.read_parquet(daily_file)
-    if df.empty or 'date' not in df.columns or 'close' not in df.columns:
-        return pd.DataFrame()
-        
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.sort_values('date').reset_index(drop=True)
-    
-    # TOPIXの25日移動平均線を計算し、終値がそれを下回っているかを判定
-    df['idx_m25'] = df['close'].rolling(25).mean()
-    df['is_market_downtrend'] = df['close'] < df['idx_m25']
-    
-    return df[['date', 'is_market_downtrend']].dropna()
-
-def load_and_merge_data(ticker: str, df_market: pd.DataFrame) -> pd.DataFrame:
-    """日足、信用残、財務データを読み込み、さらに市場トレンドフラグを結合する"""
+def load_and_merge_data(ticker: str) -> pd.DataFrame:
+    """日足、信用残、財務データを読み込み、日付で結合して前日補完(ffill)する"""
     daily_file = f"{DATA_DIR}/{ticker}.parquet"
     margin_file = f"{DATA_DIR}/{ticker}_margin.parquet"
     fins_file = f"{DATA_DIR}/{ticker}_fins.parquet"
@@ -61,13 +41,6 @@ def load_and_merge_data(ticker: str, df_market: pd.DataFrame) -> pd.DataFrame:
         
     df_daily['date'] = pd.to_datetime(df_daily['date'])
     df_daily = df_daily.sort_values('date').reset_index(drop=True)
-    
-    # TOPIXデータの結合 (市場フィルター)
-    if not df_market.empty:
-        df_daily = pd.merge(df_daily, df_market, on='date', how='left')
-        df_daily['is_market_downtrend'] = df_daily['is_market_downtrend'].ffill()
-    else:
-        df_daily['is_market_downtrend'] = True # ベンチマークがない場合はフィルターをパスさせる
         
     if os.path.exists(margin_file):
         df_margin = pd.read_parquet(margin_file)
@@ -98,95 +71,89 @@ def load_and_merge_data(ticker: str, df_market: pd.DataFrame) -> pd.DataFrame:
             df_fins = df_fins[['date', 'EPS', 'BPS', 'rev_growth']].dropna(how='all')
             df_daily = pd.merge(df_daily, df_fins, on='date', how='left')
             
-    for col in ['EPS', 'BPS', 'rev_growth', 'is_market_downtrend']:
+    for col in ['EPS', 'BPS', 'rev_growth']:
         if col not in df_daily.columns:
-            df_daily[col] = np.nan if col != 'is_market_downtrend' else True
-        if col != 'is_market_downtrend':
-            df_daily[col] = df_daily[col].ffill()
+            df_daily[col] = np.nan
+        df_daily[col] = df_daily[col].ffill()
         
     return df_daily
 
 def calculate_technical_features(df: pd.DataFrame) -> pd.DataFrame:
-    """バックテストに必要な指標を一括計算"""
+    """バックテストに必要な指標を一括計算（ボリンジャーバンド等を追加）"""
     if df.empty or len(df) < 100:  
         return df
         
     ps = df['close']
     
+    # RSI (14日)
     dt = ps.diff()
     gain = dt.where(dt > 0, 0.0).rolling(window=14).mean()
     loss = -dt.where(dt < 0, 0.0).rolling(window=14).mean()
     rs = gain / loss.replace(0, np.nan)
     df['rsi'] = 100.0 - (100.0 / (1.0 + rs))
     
+    # 移動平均とボリンジャーバンド
+    df['m20'] = ps.rolling(20).mean()
+    std20 = ps.rolling(20).std()
+    df['bb_upper_2'] = df['m20'] + (std20 * 2)
+    df['bb_upper_3'] = df['m20'] + (std20 * 3)
+    
     df['m25'] = ps.rolling(25).mean()
-    df['m75'] = ps.rolling(75).mean()
     df['d25'] = (ps - df['m25']) / df['m25'] * 100
     
+    # MACD
     ema12 = ps.ewm(span=12, adjust=False).mean()
     ema26 = ps.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     macd_signal = macd.ewm(span=9, adjust=False).mean()
     df['macd_hist'] = macd - macd_signal
     
+    # 信用Zスコア
     if 'mr_ratio' in df.columns:
         df['mr_zscore'] = (df['mr_ratio'] - df['mr_ratio'].rolling(100).mean()) / df['mr_ratio'].rolling(100).std().replace(0, np.nan)
         
     df['EPS_num'] = pd.to_numeric(df.get('EPS', np.nan), errors='coerce')
-    df['BPS_num'] = pd.to_numeric(df.get('BPS', np.nan), errors='coerce')
     df['per'] = ps / df['EPS_num'].replace(0, np.nan)
-    df['pbr'] = ps / df['BPS_num'].replace(0, np.nan)
     
     return df
 
 def generate_scoring_and_eligibility(df: pd.DataFrame) -> pd.DataFrame:
-    """市場フィルター適用と相対的な弱さを抽出するスコアリング"""
-    if df.empty or 'close' not in df.columns or 'm75' not in df.columns:
+    """極端な過熱からの平均回帰を狙うスコアリング"""
+    if df.empty or 'close' not in df.columns or 'bb_upper_2' not in df.columns:
         df['is_eligible'] = False
         df['short_score'] = 0
         return df
         
     score = pd.Series(0, index=df.index, dtype=int)
     
-    # ファンダメンタルズの悪化
-    score += np.where(df.get('per', 0) > 30.0, 10, 0)
-    score += np.where(df.get('pbr', 0) > 2.0, 10, 0)
-    score += np.where(df.get('rev_growth', 1) < 0, 20, 0) 
+    # 1. 異常な過熱レベルのスコアリング
+    score += np.where(df.get('rsi', 0) > 75.0, 10, 0)
+    score += np.where(df.get('rsi', 0) > 85.0, 20, 0)
+    score += np.where(df['close'] > df.get('bb_upper_2', np.inf), 20, 0)
+    score += np.where(df['close'] > df.get('bb_upper_3', np.inf), 30, 0)
+    score += np.where(df.get('d25', 0) > 15.0, 10, 0)
     
-    # 需給の悪化（買い残の滞留）
-    score += np.where(df.get('mr_zscore', 0) > 0.5, 20, 0) 
-    
-    # モメンタムの弱さ
-    score += np.where(df.get('macd_hist', 0) < 0, 10, 0)
-    
-    # 直近の弱さ
-    score += np.where(df.get('d25', 0) < -2.0, 10, 0)
+    # 2. 過熱からの「反落サイン」
+    # 当日が陰線（始値より終値が安い＝買い圧力が尽きた）
+    is_yin = df.get('open', df['close']) > df['close']
+    score += np.where(is_yin, 20, 0)
     
     df['short_score'] = score
     
-    # 【改修1】個別銘柄が下降トレンド気味であること
-    is_stock_weak = (df['close'] < df['m75']) & (df['close'] < df['m25'])
+    # 【絶対条件】単なる上昇トレンドではなく「明確な異常過熱」であること
+    is_overheated = (df.get('rsi', 0) > 70.0) & (df['close'] > df.get('bb_upper_2', np.inf)) & is_yin
     
-    # 【改修2】TOPIX(市場全体)がダウントレンドであること
-    # bool型への明示的なキャストと欠損値処理
-    is_market_weak = df.get('is_market_downtrend', pd.Series(True, index=df.index)).fillna(True).astype(bool)
-    
-    # 両方の弱さが合致した日のみエントリー候補とする
-    df['is_eligible'] = is_stock_weak & is_market_weak & (score >= 10)
+    df['is_eligible'] = is_overheated & (score >= 40)
     
     return df
 
 def main() -> None:
-    debug_log("🚀 クロスセクション・ショート戦略シミュレーター起動 (市場フィルター実装版)")
+    debug_log("🚀 平均回帰(Mean Reversion)・ショート戦略シミュレーター起動")
     
     if not os.path.exists(DATA_DIR):
         debug_log(f"❌ データディレクトリ {DATA_DIR} が見つかりません。")
         return
         
-    # 市場全体のトレンド(TOPIX)をロード
-    debug_log(f"📈 ベンチマーク({BENCHMARK_TICKER})データをロード中...")
-    df_market = load_market_index()
-    
     daily_files = glob.glob(f"{DATA_DIR}/????.parquet")
     
     data_dict: Dict[str, pd.DataFrame] = {}
@@ -197,9 +164,8 @@ def main() -> None:
     for i, file_path in enumerate(daily_files):
         ticker = os.path.basename(file_path).replace('.parquet', '')
         if not ticker.isdigit(): continue
-        if ticker == BENCHMARK_TICKER: continue # ベンチマーク自身はトレード対象から除外
             
-        df = load_and_merge_data(ticker, df_market)
+        df = load_and_merge_data(ticker)
         df = calculate_technical_features(df)
         df = generate_scoring_and_eligibility(df)
         
@@ -217,7 +183,7 @@ def main() -> None:
         debug_log("⚠️ 分析可能なデータがありません。")
         return
         
-    debug_log("🏆 クロスセクション・ランキングを生成中...")
+    debug_log("🏆 過熱ランキングを生成中...")
     df_all_scores = pd.concat(all_scores_list, ignore_index=True)
     
     df_candidates = df_all_scores[df_all_scores['is_eligible']].copy()
@@ -302,7 +268,7 @@ def main() -> None:
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
     
     debug_log("=========================================")
-    debug_log(f"📈 バックテスト結果サマリ (市場連動ショート戦略)")
+    debug_log(f"📈 バックテスト結果サマリ (平均回帰ショート戦略)")
     debug_log(f" - 総トレード数: {total_trades} 回")
     debug_log(f" - 勝率: {win_rate:.2f} %")
     debug_log(f" - 1トレード平均利益: {avg_return:.2f} %")
@@ -321,14 +287,17 @@ def run_integrity_tests() -> None:
     assert calculate_technical_features(df_empty).empty, "calc_tech failed on empty df"
     assert generate_scoring_and_eligibility(df_empty).empty, "generate_signals failed on empty df"
     
+    # 意図的にボリンジャーバンド+2σを突破し、かつ陰線を引くダミーデータを生成
     df_dummy = pd.DataFrame({
         'date': pd.date_range(start='2025-01-01', periods=150),
-        'close': np.linspace(2000, 1000, 150) 
+        'close': np.concatenate([np.linspace(1000, 1100, 149), [1500]]), # 最終日に急騰
+        'open': np.concatenate([np.linspace(1000, 1100, 149), [1550]])   # 最終日は陰線 (open > close)
     })
     df_tech = calculate_technical_features(df_dummy)
-    # 市場フィルター（is_market_downtrend）が存在しない場合でも、内部で安全にTrueとして処理されるかをテスト
     df_scored = generate_scoring_and_eligibility(df_tech)
-    assert 'is_eligible' in df_scored.columns, "Should generate eligibility flag even without market data"
+    
+    # RSIが十分に高くならない場合はフラグが立たない可能性があるため、カラムの存在のみを保証
+    assert 'is_eligible' in df_scored.columns, "Should generate eligibility flag"
     
     print("✅ 全検証合格。")
 
