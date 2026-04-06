@@ -10,8 +10,7 @@ from datetime import datetime
 # Pandas: https://pandas.pydata.org/docs/
 # ==========================================
 
-# Pandasの将来仕様（サイレントダウンキャスト廃止）対応
-pd.set_option('future.no_silent_downcasting', True)
+# ※ Pandasの将来仕様（サイレントダウンキャスト廃止）対応は最新環境で非推奨となったため削除
 pd.options.mode.chained_assignment = None
 
 DATA_DIR: Final[str] = "Colog_github"
@@ -42,30 +41,39 @@ def load_and_merge_data(ticker: str) -> pd.DataFrame:
     df_daily['date'] = pd.to_datetime(df_daily['date'])
     df_daily = df_daily.sort_values('date').reset_index(drop=True)
     
-    # 信用残データの結合
+    # 信用残データの結合 (列の存在チェックによる安全なアクセス)
     if os.path.exists(margin_file):
         df_margin = pd.read_parquet(margin_file)
         if not df_margin.empty and 'date' in df_margin.columns:
             df_margin['date'] = pd.to_datetime(df_margin['date'])
-            # 信用倍率の計算 (買い残 / 売り残)
-            df_margin['mr_ratio'] = pd.to_numeric(df_margin['LongMarginRatio'], errors='coerce') / pd.to_numeric(df_margin['ShortMarginRatio'], errors='coerce').replace(0, np.nan)
-            df_margin = df_margin[['date', 'mr_ratio']].dropna()
-            df_daily = pd.merge(df_daily, df_margin, on='date', how='left')
+            
+            # 必須列が存在するか物理的に確認
+            if 'LongMarginRatio' in df_margin.columns and 'ShortMarginRatio' in df_margin.columns:
+                df_margin['mr_ratio'] = pd.to_numeric(df_margin['LongMarginRatio'], errors='coerce') / pd.to_numeric(df_margin['ShortMarginRatio'], errors='coerce').replace(0, np.nan)
+                df_margin = df_margin[['date', 'mr_ratio']].dropna()
+                df_daily = pd.merge(df_daily, df_margin, on='date', how='left')
     
     if 'mr_ratio' not in df_daily.columns:
         df_daily['mr_ratio'] = np.nan
     df_daily['mr_ratio'] = df_daily['mr_ratio'].ffill()
     
-    # 財務データの結合
+    # 財務データの結合 (列の存在チェックによる安全なアクセス)
     if os.path.exists(fins_file):
         df_fins = pd.read_parquet(fins_file)
         if not df_fins.empty and 'date' in df_fins.columns:
             df_fins['date'] = pd.to_datetime(df_fins['date'])
             df_fins = df_fins.sort_values('date')
-            # 決算ごとの売上高成長率（前回発表時からの変化率）を事前計算
-            df_fins['NetSales_numeric'] = pd.to_numeric(df_fins['NetSales'], errors='coerce')
+            
+            # NetSales列が存在しない場合はNaNのシリーズを生成
+            net_sales_series = df_fins['NetSales'] if 'NetSales' in df_fins.columns else pd.Series(np.nan, index=df_fins.index)
+            df_fins['NetSales_numeric'] = pd.to_numeric(net_sales_series, errors='coerce')
             df_fins['rev_growth'] = df_fins['NetSales_numeric'].pct_change() * 100
             
+            if 'EPS' not in df_fins.columns:
+                df_fins['EPS'] = np.nan
+            if 'BPS' not in df_fins.columns:
+                df_fins['BPS'] = np.nan
+                
             df_fins = df_fins[['date', 'EPS', 'BPS', 'rev_growth']].dropna(how='all')
             df_daily = pd.merge(df_daily, df_fins, on='date', how='left')
             
@@ -195,7 +203,7 @@ def simulate_trades(df: pd.DataFrame, ticker: str) -> List[Dict[str, Any]]:
             # ショートの場合、株価「上昇」が損失
             if high_p >= entry_price * (1 + STOP_LOSS_PCT):
                 exit_idx = j
-                exit_price = entry_price * (1 + STOP_LOSS_PCT) # 厳密にスリッページなしでストップに刺さったと仮定
+                exit_price = entry_price * (1 + STOP_LOSS_PCT)
                 exit_reason = "stop_loss"
                 break
                 
@@ -291,6 +299,11 @@ def run_integrity_tests() -> None:
     assert calculate_technical_features(df_empty).empty, "calc_tech failed on empty df"
     assert generate_short_signals(df_empty).empty, "generate_signals failed on empty df"
     assert len(simulate_trades(df_empty, "9999")) == 0, "simulate_trades failed on empty df"
+    
+    # 欠損カラムに対する耐性テスト
+    df_missing_cols = pd.DataFrame({'date': ['2026-01-01'], 'close': [1000]})
+    assert 'rsi' in calculate_technical_features(df_missing_cols).columns, "Should handle missing cols gracefully"
+    
     print("✅ 全検証合格。")
 
 if __name__ == "__main__":
