@@ -1,6 +1,9 @@
 name: Weekly Backtest System
 
 on:
+  push:                   # プッシュ時に自動実行
+    branches:
+      - main              # 対象ブランチ（環境に合わせて main や master に調整してください）
   workflow_dispatch:      # 手動実行可能
 
 env:
@@ -9,6 +12,7 @@ env:
 
 # ==========================================
 # 2025-2026年 最新公式ドキュメント準拠検証結果
+# GitHub Actions Events: https://docs.github.com/ja/actions/using-workflows/events-that-trigger-workflows
 # GitHub Actions Cache: https://docs.github.com/ja/actions/using-workflows/caching-dependencies-to-speed-up-workflows
 # ==========================================
 
