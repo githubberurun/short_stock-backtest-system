@@ -1,0 +1,95 @@
+name: Weekly Backtest System
+
+on:
+  workflow_dispatch:      # 手動実行可能
+
+env:
+  # Node.js 20の非推奨警告への対応 (Node.js 24への強制移行フラグ)
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# ==========================================
+# 2025-2026年 最新公式ドキュメント準拠検証結果
+# GitHub Actions Cache: https://docs.github.com/ja/actions/using-workflows/caching-dependencies-to-speed-up-workflows
+# ==========================================
+
+jobs:
+  run-system:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # --- キャッシュの復元 ---
+      # 過去の実行（または途中で落ちた実行）で保存されたデータを復元する
+      - name: Restore data cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            Colog_github
+            Colog_github_cache
+            data
+          # run_id と run_attempt をキーに含めることで実行ごとに一意にし、
+          # リストア時は前方一致(restore-keys)で最新の取得済みデータを引っ張る
+          key: jquants-data-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            jquants-data-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+        
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas pyarrow fastparquet numpy yfinance
+
+      - name: Execute Pipeline
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          # Pythonの標準出力をバッファリングせず即座にログへ書き出す設定
+          PYTHONUNBUFFERED: "1"
+        run: |
+          # JQUANTS_API_KEYが設定されていない場合はパイプラインを停止
+          if [ -z "$JQUANTS_API_KEY" ]; then
+            echo "Error: JQUANTS_API_KEY is not set in secrets."
+            exit 1
+          fi
+          
+          # 1. データ取得 (対象銘柄 & ベンチマーク) & 内部テスト
+          # -u フラグでバッファリングを無効化し、リアルタイムでログを表示
+          python -u data_fetcher.py
+          
+          # デバッグ用: 取得されたファイル数と容量の確認 (日足・信用・財務が揃っているか確認)
+          echo "=== Downloaded Data Check ==="
+          ls -l Colog_github/ | wc -l | xargs -I{} echo "Total files in Colog_github: {}"
+          du -sh Colog_github/
+          echo "============================="
+          
+          # 2. 統合バックテスト実行
+          python -u backtest_runner.py
+
+      # --- キャッシュの保存 ---
+      # Execute PipelineがOOMキル等で失敗(Failed)した場合でも、必ず取得済みの最新データを保存する
+      - name: Save data cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            Colog_github
+            Colog_github_cache
+            data
+          key: jquants-data-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # --- 対象フォルダの修正 ---
+      - name: Upload Results
+        if: always() # エラーが起きても可能な限り結果をアップロード
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: |
+            Colog_github/*.parquet
+            data/*.parquet
+            data/*.txt
+            data/*.csv
+            backtest_report.csv
