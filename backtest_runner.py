@@ -15,10 +15,11 @@ pd.options.mode.chained_assignment = None
 DATA_DIR: Final[str] = "Colog_github"
 
 # --- パラメータ設定 (小型株・バブル崩壊ショート戦略) ---
-MAX_SHORTS_PER_DAY: Final[int] = 5   # 1日にショートを仕掛ける最大銘柄数
-HOLDING_PERIOD: Final[int] = 3       # パニック下落の初動3日間だけを狙う
-STOP_LOSS_PCT: Final[float] = 0.08   # 小型株のボラティリティを考慮し、損切り幅を8%に拡大
-TARGET_PROFIT: Final[float] = 0.10   # 利益目標は10%（リスクリワード比 > 1.0）
+MAX_SHORTS_PER_DAY: Final[int] = 5   
+HOLDING_PERIOD: Final[int] = 3       
+STOP_LOSS_PCT: Final[float] = 0.08   
+TARGET_PROFIT: Final[float] = 0.10   
+MIN_TURNOVER_JPY: Final[float] = 100_000_000.0 # 【改修】シグナル発生日の最低売買代金(1億円)
 
 def debug_log(msg: str) -> None:
     if not isinstance(msg, str): 
@@ -26,9 +27,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 def load_data(ticker: str) -> pd.DataFrame:
-    """日足データのみを読み込み、日付でソートする（財務・信用データ不要）"""
     daily_file = f"{DATA_DIR}/{ticker}.parquet"
-    
     if not os.path.exists(daily_file):
         return pd.DataFrame()
         
@@ -42,38 +41,35 @@ def load_data(ticker: str) -> pd.DataFrame:
     return df_daily
 
 def calculate_technical_features(df: pd.DataFrame) -> pd.DataFrame:
-    """小型株特有のバブル崩壊を検知するためのテクニカル指標を計算"""
-    # 新興株は上場直後（IPO）も多いため、最低必要日数を30日に大幅短縮
     if df.empty or len(df) < 30:  
         return df
         
     ps = df['close']
     
-    # 1. 短期トレンドライン (5日線) とその前日値
     df['m5'] = ps.rolling(5).mean()
     df['prev_m5'] = df['m5'].shift(1)
     df['prev_close'] = ps.shift(1)
     
-    # 2. 中期トレンドからの過熱度 (25日線乖離率)
     df['m25'] = ps.rolling(25).mean()
     df['d25'] = (ps - df['m25']) / df['m25'] * 100
     
-    # 3. RSI (14日)
     dt = ps.diff()
     gain = dt.where(dt > 0, 0.0).rolling(window=14).mean()
     loss = -dt.where(dt < 0, 0.0).rolling(window=14).mean()
     rs = gain / loss.replace(0, np.nan)
     df['rsi'] = 100.0 - (100.0 / (1.0 + rs))
     
-    # 4. 出来高の急増検知（バブルの兆候）
     vs = df['volume']
     df['v_ma20'] = vs.rolling(20).mean()
     df['vol_ratio'] = vs / df['v_ma20'].replace(0, np.nan)
     
+    # 動的流動性フィルター用の売買代金を確保
+    if 'turnover' not in df.columns:
+        df['turnover'] = df['close'] * df['volume']
+        
     return df
 
 def generate_scoring_and_eligibility(df: pd.DataFrame) -> pd.DataFrame:
-    """バブル崩壊（5日線割れ）の検知とスコアリング"""
     if df.empty or 'close' not in df.columns or 'm5' not in df.columns:
         df['is_eligible'] = False
         df['short_score'] = 0
@@ -81,20 +77,19 @@ def generate_scoring_and_eligibility(df: pd.DataFrame) -> pd.DataFrame:
         
     score = pd.Series(0, index=df.index, dtype=int)
     
-    # 【絶対条件1】バブル状態であること：25日線から15%以上乖離している
     is_stretched = df.get('d25', 0) > 15.0
-    
-    # 【絶対条件2】トレンドの崩壊：前日は5日線の上にいたが、今日は5日線を明確に下抜けた
     is_broken = (df.get('prev_close', 0) > df.get('prev_m5', np.inf)) & (df['close'] < df['m5'])
     
-    # スコアリング（より乖離が大きく、より出来高を伴って崩れたものを上位にする）
+    # 【改修】シグナル発生日において、最低限の流動性があるか（約定可能性の担保）
+    is_liquid = df.get('turnover', 0) >= MIN_TURNOVER_JPY
+    
     score += np.where(df.get('d25', 0) > 20.0, 20, 0)
-    score += np.where(df.get('d25', 0) > 30.0, 30, 0) # 狂気のバブル
+    score += np.where(df.get('d25', 0) > 30.0, 30, 0) 
     score += np.where(df.get('rsi', 0) > 75.0, 10, 0)
-    score += np.where(df.get('vol_ratio', 0) > 2.0, 20, 0) # 出来高を伴う下落は信憑性が高い
+    score += np.where(df.get('vol_ratio', 0) > 2.0, 20, 0) 
     
     df['short_score'] = score
-    df['is_eligible'] = is_stretched & is_broken
+    df['is_eligible'] = is_stretched & is_broken & is_liquid
     
     return df
 
@@ -155,7 +150,6 @@ def main() -> None:
         idx = row.original_idx
         df_ticker = data_dict[ticker]
         
-        # 翌日の始値でエントリー
         entry_idx = idx + 1
         if entry_idx >= len(df_ticker):
             continue
@@ -174,14 +168,12 @@ def main() -> None:
             high_p = df_ticker.at[j, 'high']
             low_p = df_ticker.at[j, 'low']
             
-            # ストップロス判定（逆行）
             if high_p >= entry_price * (1 + STOP_LOSS_PCT):
                 exit_idx = j
                 exit_price = entry_price * (1 + STOP_LOSS_PCT)
                 exit_reason = "stop_loss"
                 break
                 
-            # テイクプロフィット判定（順行）
             if low_p <= entry_price * (1 - TARGET_PROFIT):
                 exit_idx = j
                 exit_price = entry_price * (1 - TARGET_PROFIT)
@@ -222,7 +214,7 @@ def main() -> None:
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
     
     debug_log("=========================================")
-    debug_log(f"📈 バックテスト結果サマリ (小型株バブル崩壊・ショート戦略)")
+    debug_log(f"📈 バックテスト結果サマリ (バイアス排除・動的流動性フィルター版)")
     debug_log(f" - 総トレード数: {total_trades} 回")
     debug_log(f" - 勝率: {win_rate:.2f} %")
     debug_log(f" - 1トレード平均利益: {avg_return:.2f} %")
@@ -232,26 +224,21 @@ def main() -> None:
     df_trades.to_csv("backtest_report.csv", index=False)
     debug_log("✅ 全トレード履歴を backtest_report.csv に出力しました。")
 
-# ==========================================
-# 空データ・異常値に対する堅牢性証明テスト
-# ==========================================
 def run_integrity_tests() -> None:
     print("🧪 バリデーション中...")
     df_empty = pd.DataFrame()
     assert calculate_technical_features(df_empty).empty, "calc_tech failed on empty df"
     assert generate_scoring_and_eligibility(df_empty).empty, "generate_signals failed on empty df"
     
-    # バブル崩壊のダミーデータ生成（25日線乖離 + 5日線割れ）
     df_dummy = pd.DataFrame({
         'date': pd.date_range(start='2025-01-01', periods=40),
-        'close': np.concatenate([np.linspace(1000, 2000, 39), [1800]]), # 最終日に急落
-        'volume': np.ones(40) * 10000
+        'close': np.concatenate([np.linspace(1000, 2000, 39), [1800]]),
+        'volume': np.ones(40) * 100000 
     })
     df_tech = calculate_technical_features(df_dummy)
     df_scored = generate_scoring_and_eligibility(df_tech)
     
     assert 'is_eligible' in df_scored.columns, "Should generate eligibility flag"
-    
     print("✅ 全検証合格。")
 
 if __name__ == "__main__":
